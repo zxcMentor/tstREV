@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
-	"log"
-
+	"github.com/go-redis/redis/v8"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
+	"log"
 )
 
 type City struct {
@@ -15,14 +17,17 @@ type City struct {
 }
 
 type CityRepository struct {
-	db *sqlx.DB
+	db    *sqlx.DB
+	cache *redis.Client
 }
 
-func NewCityRepository(db *sqlx.DB) *CityRepository {
-	return &CityRepository{db: db}
+func NewCityRepository(db *sqlx.DB, client *redis.Client) *CityRepository {
+
+	return &CityRepository{db: db, cache: client}
 }
 
 func (r *CityRepository) Create(city *City) error {
+
 	query := `INSERT INTO cities (name, state) VALUES ($1, $2)`
 	_, err := r.db.Exec(query, city.Name, city.State)
 	fmt.Println("create city")
@@ -43,15 +48,38 @@ func (r *CityRepository) Update(city *City) error {
 
 func (r *CityRepository) List() ([]City, error) {
 	var cities []City
-	query := `SELECT * FROM cities`
-	err := r.db.Select(&cities, query)
-	fmt.Println(cities)
-	return cities, err
+	fmt.Println("проверка кеша")
+	res, err := r.cache.Get(context.Background(), "cities").Result()
+	if err == nil {
+		err = json.Unmarshal([]byte(res), &cities)
+		if err != nil {
+			log.Fatalln(err)
+		}
+		fmt.Println("вывод кеша")
+		return cities, nil
+	} else {
+
+		fmt.Println("вывод из бд")
+		query := `SELECT * FROM cities`
+		err = r.db.Select(&cities, query)
+		if err != nil {
+			return nil, err
+		}
+
+		jsonData, _ := json.Marshal(cities)
+		r.cache.Set(context.Background(), "cities", jsonData, 0)
+		return cities, nil
+	}
 }
 
 func CreateTables(db *sqlx.DB) error {
 	fmt.Println("table create")
-	_, err := db.Exec(`CREATE TABLE cities (id SERIAL PRIMARY KEY,name VARCHAR(30) NOT NULL,state VARCHAR(30) NOT NULL)`)
+	rows, err := db.Query(`SELECT * FROM cities LIMIT 1`)
+	if err == nil {
+		rows.Close()
+		return nil
+	}
+	_, err = db.Exec(`CREATE TABLE cities (id SERIAL PRIMARY KEY,name VARCHAR(30) NOT NULL,state VARCHAR(30) NOT NULL)`)
 	if err != nil {
 		log.Println(err)
 	}
@@ -63,7 +91,7 @@ func main() {
 	fmt.Println("start")
 	dbHost := "localhost"
 	dbPort := "5432"
-	dbUser := "user"
+	dbUser := "users"
 	dbPassword := "secret"
 	dbName := "postgres"
 	sslmode := "disable"
@@ -75,10 +103,11 @@ func main() {
 		log.Fatalln(err)
 	}
 	defer db.Close()
-	fmt.Println("createTable")
+
 	err = CreateTables(db)
 	log.Println(err)
-	repo := NewCityRepository(db)
+	cl := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	repo := NewCityRepository(db, cl)
 
 	city := City{
 		Id:    1,
@@ -91,8 +120,16 @@ func main() {
 		log.Println(err)
 	}
 	list, err := repo.List()
-	for _, n := range list {
-		fmt.Println(n.Name)
+	if err != nil {
+		log.Fatalln(err)
 	}
+	fmt.Println(list)
+
+	list1, err := repo.List()
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	fmt.Println(list1)
 
 }
